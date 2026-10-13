@@ -1,110 +1,86 @@
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import defaultdict
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# ---------------------------------------------------------
-# Your assigned values
-# ---------------------------------------------------------
-ALLOWED_ORIGINS = [
-    "https://app-rtbkwg.example.com",
+RATE_LIMIT = 11
+WINDOW_SECONDS = 10
 
-    # Add the exam/verification page origin here.
-    # Replace this with the exact origin shown by your assignment page.
-    "https://app-rtbkwg.example.com",
-]
-
-RATE_LIMIT = 11          # B requests
-RATE_WINDOW = 10         # per 10 seconds
-
-# Stores request timestamps for each client ID.
-# Example:
-# {
-#   "client-1": deque([1728830001.2, 1728830002.4, ...]),
-#   "client-2": deque([...])
-# }
-client_requests = defaultdict(deque)
+client_requests = defaultdict(list)
+MY_EMAIL = "24f3003806@ds.study.iitm.ac.in"  # Your logged-in email from the instructions
 
 
-# ---------------------------------------------------------
-# Middleware 3: Per-client rate limiter
-# ---------------------------------------------------------
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    client_id = request.headers.get("X-Client-Id")
-
-    # If no client ID is provided, do not rate-limit it.
-    if not client_id:
-        return await call_next(request)
-
-    now = time.time()
-
-    # Remove timestamps older than the 10-second window.
-    while (
-        client_requests[client_id]
-        and now - client_requests[client_id][0] >= RATE_WINDOW
-    ):
-        client_requests[client_id].popleft()
-
-    # If this client already made 11 requests in the current window, block it.
-    if len(client_requests[client_id]) >= RATE_LIMIT:
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Rate limit exceeded"},
-        )
-
-    # Otherwise, record this request and allow it.
-    client_requests[client_id].append(now)
-    return await call_next(request)
-
-
-# ---------------------------------------------------------
-# Middleware 1: Request context
-# ---------------------------------------------------------
-@app.middleware("http")
-async def request_context_middleware(request: Request, call_next):
-    # Reuse the incoming request ID if present.
+@app.get("/ping")
+def ping(request: Request, response: Response):
+    # Request Context: Get existing X-Request-ID or generate a new one
     request_id = request.headers.get("X-Request-ID")
-
-    # Otherwise create a fresh unique ID.
     if not request_id:
         request_id = str(uuid.uuid4())
 
-    # Save it so the endpoint can read it.
-    request.state.request_id = request_id
-
-    response = await call_next(request)
-
-    # Always send it back in the response header too.
+    # Ensure it's returned in the response headers as well
     response.headers["X-Request-ID"] = request_id
 
+    return {
+        "email": MY_EMAIL,
+        "request_id": request_id,
+    }
+
+
+@app.middleware("http")
+async def rate_limit_and_context_middleware(request: Request, call_next):
+    # Skip rate limiting for CORS preflight requests
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    client_id = request.headers.get("X-Client-Id")
+    client_id = client_id or "anonymous"
+
+    now = time.time()
+
+    # Clean timestamps older than the 10-second window
+    client_requests[client_id] = [
+        timestamp for timestamp in client_requests[client_id]
+        if now - timestamp < WINDOW_SECONDS
+    ]
+
+    if len(client_requests[client_id]) >= RATE_LIMIT:
+        oldest_request = client_requests[client_id][0]
+        retry_after = max(1, int(WINDOW_SECONDS - (now - oldest_request)) + 1)
+
+        # Build response with proper headers including CORS and Retry-After
+        return Response(
+            content='{"detail": "Rate limit exceeded"}',
+            status_code=429,
+            media_type="application/json",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    client_requests[client_id].append(now)
+    
+    response = await call_next(request)
     return response
 
 
-# ---------------------------------------------------------
-# Middleware 2: CORS
-# ---------------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "Middleware Stack API is running"}
+
+
+# CORS Middleware added at the very end to act as the outermost wrapper
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=[
+        "https://app-rtbkwg.example.com",
+        "https://exam.sanand.workers.dev",
+        "http://localhost",
+        "http://localhost:3000",
+    ],
     allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["X-Request-ID", "X-Client-Id"],
-    expose_headers=["X-Request-ID"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
-
-
-# ---------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------
-@app.get("/ping")
-async def ping(request: Request):
-    return {
-        "email": "24f3003806@ds.study.iitm.ac.in",
-        "request_id": request.state.request_id,
-    }
